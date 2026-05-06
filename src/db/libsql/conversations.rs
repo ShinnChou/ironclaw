@@ -61,6 +61,33 @@ impl ConversationStore for LibSqlBackend {
         Ok(id)
     }
 
+    async fn add_conversation_message_if_empty(
+        &self,
+        conversation_id: Uuid,
+        role: &str,
+        content: &str,
+    ) -> Result<bool, DatabaseError> {
+        let conn = self.connect().await?;
+        let id = Uuid::new_v4();
+        let now = fmt_ts(&Utc::now());
+        let conv_str = conversation_id.to_string();
+        let result = conn
+            .execute(
+                "INSERT INTO conversation_messages (id, conversation_id, role, content, created_at) \
+                 SELECT ?1, ?2, ?3, ?4, ?5 \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM conversation_messages WHERE conversation_id = ?2 \
+                 )",
+                params![id.to_string(), conv_str, role, content, now],
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        if result > 0 {
+            self.touch_conversation(conversation_id).await?;
+        }
+        Ok(result > 0)
+    }
+
     async fn ensure_conversation(
         &self,
         id: Uuid,
@@ -76,7 +103,9 @@ impl ConversationStore for LibSqlBackend {
             r#"
                 INSERT INTO conversations (id, channel, user_id, thread_id, source_channel, started_at, last_activity)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                ON CONFLICT (id) DO UPDATE SET last_activity = excluded.last_activity
+                ON CONFLICT (id) DO UPDATE SET
+                    last_activity = excluded.last_activity,
+                    source_channel = COALESCE(conversations.source_channel, excluded.source_channel)
                 WHERE conversations.user_id = excluded.user_id
                   AND conversations.channel = excluded.channel
                 "#,
@@ -131,6 +160,16 @@ impl ConversationStore for LibSqlBackend {
                 .get("thread_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let live_state = metadata
+                .get("live_state")
+                .and_then(|v| v.get("state"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let live_state_started_at = metadata
+                .get("live_state")
+                .and_then(|v| v.get("started_at"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let sql_title = get_opt_text(&row, 6);
             let title = sql_title.or_else(|| {
                 metadata
@@ -149,6 +188,8 @@ impl ConversationStore for LibSqlBackend {
                 message_count: get_i64(&row, 5),
                 title,
                 thread_type,
+                live_state,
+                live_state_started_at,
                 channel: get_text(&row, 4),
             });
         }
@@ -198,6 +239,16 @@ impl ConversationStore for LibSqlBackend {
                 .get("thread_type")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let live_state = metadata
+                .get("live_state")
+                .and_then(|v| v.get("state"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let live_state_started_at = metadata
+                .get("live_state")
+                .and_then(|v| v.get("started_at"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let sql_title = get_opt_text(&row, 6);
             let title = sql_title.or_else(|| {
                 metadata
@@ -216,6 +267,8 @@ impl ConversationStore for LibSqlBackend {
                 message_count: get_i64(&row, 5),
                 title,
                 thread_type,
+                live_state,
+                live_state_started_at,
                 channel: get_text(&row, 4),
             });
         }
@@ -398,7 +451,7 @@ impl ConversationStore for LibSqlBackend {
         let mut rows = conn
             .query(
                 r#"
-                SELECT id FROM conversations
+                SELECT id, source_channel FROM conversations
                 WHERE user_id = ?1 AND channel = ?2
                   AND json_extract(metadata, '$.thread_type') = 'assistant'
                 LIMIT 1
@@ -414,9 +467,19 @@ impl ConversationStore for LibSqlBackend {
             .map_err(|e| DatabaseError::Query(e.to_string()))?
         {
             let id_str: String = row.get(0).unwrap_or_default();
-            return id_str
+            let source_channel: Option<String> = row.get(1).unwrap_or_default();
+            let id: Uuid = id_str
                 .parse()
-                .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()));
+                .map_err(|_| DatabaseError::Serialization("Invalid UUID".to_string()))?;
+            if source_channel.is_none() {
+                conn.execute(
+                    "UPDATE conversations SET source_channel = ?2 WHERE id = ?1 AND source_channel IS NULL",
+                    params![id.to_string(), channel],
+                )
+                .await
+                .map_err(|e| DatabaseError::Query(e.to_string()))?;
+            }
+            return Ok(id);
         }
 
         // Create new
@@ -424,8 +487,8 @@ impl ConversationStore for LibSqlBackend {
         let now = fmt_ts(&Utc::now());
         let metadata = serde_json::json!({"thread_type": "assistant", "title": "Assistant"});
         conn.execute(
-            "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-            params![id.to_string(), channel, user_id, metadata.to_string(), now],
+            "INSERT INTO conversations (id, channel, user_id, metadata, source_channel, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![id.to_string(), channel, user_id, metadata.to_string(), channel, now],
         )
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -853,6 +916,97 @@ mod tests {
             source.as_deref(),
             Some("telegram"),
             "upsert should not overwrite original source_channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_source_channel_backfilled_when_legacy_row_is_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_source_channel_backfill.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let conv_id = Uuid::new_v4();
+        let user_id = "user-backfill";
+
+        backend
+            .ensure_conversation(conv_id, "gateway", user_id, None, None)
+            .await
+            .unwrap();
+
+        backend
+            .ensure_conversation(conv_id, "gateway", user_id, None, Some("gateway"))
+            .await
+            .unwrap();
+
+        let source = backend
+            .get_conversation_source_channel(conv_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            source.as_deref(),
+            Some("gateway"),
+            "upsert should backfill source_channel when the existing row is legacy NULL"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_assistant_conversation_sets_source_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_assistant_source_channel.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let conv_id = backend
+            .get_or_create_assistant_conversation("assistant-user", "gateway")
+            .await
+            .unwrap();
+
+        let source = backend
+            .get_conversation_source_channel(conv_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            source.as_deref(),
+            Some("gateway"),
+            "assistant conversation should persist its source_channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_or_create_assistant_conversation_backfills_legacy_source_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_assistant_source_channel_backfill.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let conv_id = Uuid::new_v4();
+        let user_id = "assistant-backfill";
+        let now = fmt_ts(&Utc::now());
+        let metadata = serde_json::json!({"thread_type": "assistant", "title": "Assistant"});
+
+        let conn = backend.connect().await.unwrap();
+        conn.execute(
+            "INSERT INTO conversations (id, channel, user_id, metadata, started_at, last_activity) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![conv_id.to_string(), "gateway", user_id, metadata.to_string(), now],
+        )
+        .await
+        .unwrap();
+
+        let found = backend
+            .get_or_create_assistant_conversation(user_id, "gateway")
+            .await
+            .unwrap();
+        assert_eq!(found, conv_id);
+
+        let source = backend
+            .get_conversation_source_channel(conv_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            source.as_deref(),
+            Some("gateway"),
+            "assistant thread lookup should backfill a legacy NULL source_channel"
         );
     }
 }

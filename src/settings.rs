@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::bootstrap::ironclaw_base_dir;
 
 /// A custom LLM provider defined by the user through the web UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CustomLlmProviderSettings {
     /// Unique identifier (used as `llm_backend` value).
     pub id: String,
@@ -37,6 +37,20 @@ pub struct CustomLlmProviderSettings {
     pub builtin: bool,
 }
 
+impl std::fmt::Debug for CustomLlmProviderSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomLlmProviderSettings")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("adapter", &self.adapter)
+            .field("base_url", &self.base_url)
+            .field("default_model", &self.default_model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("builtin", &self.builtin)
+            .finish()
+    }
+}
+
 /// Per-provider overrides for built-in LLM providers (API key and/or model).
 ///
 /// Stored as `llm_builtin_overrides` in the settings store, keyed by provider ID
@@ -44,7 +58,7 @@ pub struct CustomLlmProviderSettings {
 ///
 /// Note: The global `selected_model` (if set) takes precedence over these
 /// per-provider overrides, which in turn take precedence over environment variables.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct LlmBuiltinOverride {
     /// API key override. Takes precedence over environment variables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,6 +69,16 @@ pub struct LlmBuiltinOverride {
     /// Base URL override. Takes precedence over environment variables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+}
+
+impl std::fmt::Debug for LlmBuiltinOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmBuiltinOverride")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 /// Canonical secret name for a built-in provider's API key.
@@ -150,6 +174,12 @@ pub struct Settings {
     #[serde(default)]
     pub selected_model: Option<String>,
 
+    /// Default sampling temperature for LLM requests (0.0–2.0).
+    /// When set, used as the default for conversational turns.
+    /// Per-request temperature (e.g. from the API) takes precedence.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+
     // === Step 5: Embeddings ===
     /// Embeddings configuration.
     #[serde(default)]
@@ -217,9 +247,21 @@ pub struct Settings {
     #[serde(default)]
     pub search: SearchSettings,
 
+    /// Mission configuration.
+    #[serde(default)]
+    pub missions: MissionSettings,
+
     /// Transcription configuration.
     #[serde(default)]
     pub transcription: Option<TranscriptionSettings>,
+
+    /// Per-tool permission overrides.
+    ///
+    /// Keys are tool names; persisted values are authoritative. Absent tools
+    /// fall back to seeded defaults for well-known tools, then `AskEachTime`.
+    #[serde(default)]
+    pub tool_permissions:
+        std::collections::HashMap<String, crate::tools::permissions::PermissionState>,
 }
 
 /// Source for the secrets master key.
@@ -396,8 +438,10 @@ pub struct ChannelSettings {
     pub wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
 
     /// Enabled WASM channels by name.
-    /// Channels not in this list but present in the channels directory will still load.
-    /// This is primarily used by the setup wizard to track which channels were configured.
+    /// Primarily used by the setup wizard to track which channels were configured.
+    ///
+    /// Startup treats this as a fallback restore source only until
+    /// `activated_channels` has been persisted by the runtime.
     #[serde(default)]
     pub wasm_channels: Vec<String>,
 
@@ -408,6 +452,10 @@ pub struct ChannelSettings {
     /// Directory containing WASM channel modules.
     #[serde(default)]
     pub wasm_channels_dir: Option<PathBuf>,
+
+    /// CLI mode: "tui" for rich terminal UI, empty/absent for simple REPL.
+    #[serde(default)]
+    pub cli_mode: Option<String>,
 }
 
 impl Default for ChannelSettings {
@@ -433,6 +481,7 @@ impl Default for ChannelSettings {
             wasm_channels: Vec::new(),
             wasm_channels_enabled: true,
             wasm_channels_dir: None,
+            cli_mode: Some("tui".to_string()),
         }
     }
 }
@@ -645,7 +694,7 @@ fn default_wasm_timeout() -> u64 {
 }
 
 fn default_wasm_fuel_limit() -> u64 {
-    10_000_000
+    500_000_000
 }
 
 impl Default for WasmSettings {
@@ -700,6 +749,10 @@ pub struct SandboxSettings {
     /// Whether Claude Code sandbox mode is enabled.
     #[serde(default)]
     pub claude_code_enabled: bool,
+
+    /// Whether ACP (Agent Client Protocol) agent mode is enabled.
+    #[serde(default)]
+    pub acp_enabled: bool,
 }
 
 fn default_sandbox_policy() -> String {
@@ -734,6 +787,7 @@ impl Default for SandboxSettings {
             auto_pull_image: true,
             extra_allowed_domains: Vec::new(),
             claude_code_enabled: false,
+            acp_enabled: false,
         }
     }
 }
@@ -979,6 +1033,11 @@ pub struct SearchSettings {
     /// Vector weight for fusion. `None` = use per-strategy default.
     #[serde(default)]
     pub vector_weight: Option<f32>,
+
+    /// Whether reasoning-augmented recall is enabled for memory search.
+    /// `None` = use env/default (false).
+    #[serde(default)]
+    pub reasoning_enabled: Option<bool>,
 }
 
 fn default_search_fusion_strategy() -> String {
@@ -996,8 +1055,18 @@ impl Default for SearchSettings {
             rrf_k: default_search_rrf_k(),
             fts_weight: None,
             vector_weight: None,
+            reasoning_enabled: None,
         }
     }
+}
+
+/// Mission-related settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MissionSettings {
+    /// Conversation insights extraction interval (every N completed threads).
+    /// `None` = use env/default (5). Minimum: 1.
+    #[serde(default)]
+    pub insights_interval: Option<u32>,
 }
 
 /// Transcription pipeline settings.
@@ -1388,6 +1457,31 @@ mod tests {
         assert_eq!(
             restored.selected_model,
             Some("claude-3-5-sonnet-20241022".to_string())
+        );
+    }
+
+    #[test]
+    fn test_from_db_map_tool_permissions() {
+        use crate::tools::permissions::PermissionState;
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "tool_permissions.http".to_string(),
+            serde_json::Value::String("always_allow".to_string()),
+        );
+        map.insert(
+            "tool_permissions.shell".to_string(),
+            serde_json::Value::String("ask_each_time".to_string()),
+        );
+        let settings = Settings::from_db_map(&map);
+        assert_eq!(
+            settings.tool_permissions.get("http"),
+            Some(&PermissionState::AlwaysAllow),
+            "tool_permissions.http should be AlwaysAllow, got {:?}",
+            settings.tool_permissions
+        );
+        assert_eq!(
+            settings.tool_permissions.get("shell"),
+            Some(&PermissionState::AskEachTime),
         );
     }
 
@@ -1970,6 +2064,15 @@ mod tests {
                 max_parallel_jobs: 10,
                 ..Default::default()
             },
+            search: SearchSettings {
+                reasoning_enabled: Some(true),
+                fts_weight: Some(0.4),
+                vector_weight: Some(0.6),
+                ..Default::default()
+            },
+            missions: MissionSettings {
+                insights_interval: Some(7),
+            },
             ..Default::default()
         };
 
@@ -2037,6 +2140,26 @@ mod tests {
         assert_eq!(
             restored.agent.max_parallel_jobs, 10,
             "agent.max_parallel_jobs lost"
+        );
+        assert_eq!(
+            restored.search.reasoning_enabled,
+            Some(true),
+            "search.reasoning_enabled lost"
+        );
+        assert_eq!(
+            restored.search.fts_weight,
+            Some(0.4),
+            "search.fts_weight lost"
+        );
+        assert_eq!(
+            restored.search.vector_weight,
+            Some(0.6),
+            "search.vector_weight lost"
+        );
+        assert_eq!(
+            restored.missions.insights_interval,
+            Some(7),
+            "missions.insights_interval lost"
         );
     }
 
@@ -2707,6 +2830,46 @@ mod tests {
             base.selected_model.as_deref(),
             Some("toml-model"),
             "TOML selected_model should be preserved when DB has no value"
+        );
+    }
+
+    #[test]
+    fn test_custom_provider_debug_redacts_api_key() {
+        let provider = CustomLlmProviderSettings {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            adapter: "open_ai_completions".to_string(),
+            base_url: Some("https://api.example.com".to_string()),
+            default_model: Some("gpt-4".to_string()),
+            api_key: Some("sk-super-secret-key".to_string()),
+            builtin: false,
+        };
+        let debug_output = format!("{:?}", provider);
+        assert!(
+            !debug_output.contains("sk-super-secret-key"),
+            "Debug output must not contain the real API key"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for api_key"
+        );
+    }
+
+    #[test]
+    fn test_builtin_override_debug_redacts_api_key() {
+        let override_val = LlmBuiltinOverride {
+            api_key: Some("sk-secret-123".to_string()),
+            model: Some("gpt-4".to_string()),
+            base_url: None,
+        };
+        let debug_output = format!("{:?}", override_val);
+        assert!(
+            !debug_output.contains("sk-secret-123"),
+            "Debug output must not contain the real API key"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output must show [REDACTED] for api_key"
         );
     }
 }

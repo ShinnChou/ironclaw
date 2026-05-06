@@ -27,7 +27,8 @@ use crate::agent::routine_engine::RoutineEngine;
 use crate::context::JobContext;
 use crate::db::Database;
 use crate::tools::tool::{
-    ApprovalRequirement, Tool, ToolDiscoverySummary, ToolError, ToolOutput, require_str,
+    ApprovalRequirement, EngineCompatibility, Tool, ToolDiscoverySummary, ToolError, ToolOutput,
+    require_str,
 };
 
 // ==================== routine_create ====================
@@ -1118,6 +1119,7 @@ impl Tool for RoutineCreateTool {
         "Create a new routine (scheduled or event-driven task). \
          Supports cron schedules, event pattern matching, system events, and manual triggers. \
          Use this when the user wants something to happen periodically or reactively. \
+         Do not use this for immediate one-shot requests like 'do it now', 'right now', or 'immediately'; complete those in the current thread. \
          Creation saves the routine, but does not verify that it will execute successfully."
     }
 
@@ -1238,6 +1240,10 @@ impl Tool for RoutineCreateTool {
     fn requires_sanitization(&self) -> bool {
         false
     }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
+    }
 }
 
 // ==================== routine_list ====================
@@ -1327,6 +1333,10 @@ impl Tool for RoutineListTool {
 
     fn requires_sanitization(&self) -> bool {
         false
+    }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
     }
 }
 
@@ -1491,6 +1501,10 @@ impl Tool for RoutineUpdateTool {
     fn requires_sanitization(&self) -> bool {
         false
     }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
+    }
 }
 
 // ==================== routine_delete ====================
@@ -1578,6 +1592,10 @@ impl Tool for RoutineDeleteTool {
     fn requires_sanitization(&self) -> bool {
         false
     }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
+    }
 }
 
 // ==================== routine_fire ====================
@@ -1658,6 +1676,10 @@ impl Tool for RoutineFireTool {
 
     fn requires_sanitization(&self) -> bool {
         false
+    }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
     }
 }
 
@@ -1798,6 +1820,10 @@ impl Tool for RoutineHistoryTool {
     fn requires_sanitization(&self) -> bool {
         false
     }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
+    }
 }
 
 // ==================== event_emit ====================
@@ -1862,6 +1888,10 @@ impl Tool for EventEmitTool {
 
     fn requires_sanitization(&self) -> bool {
         true
+    }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
     }
 }
 
@@ -2673,4 +2703,8 @@ mod tests {
                 && max_iterations == 25
         ));
     }
+
+    // Engine compatibility for routine tools is verified at the registry level
+    // via `tool_definitions_for_engine_excludes_v1_only_from_v2`. Each tool's
+    // `engine_compatibility()` returns `V1Only` — see the impl blocks above.
 }

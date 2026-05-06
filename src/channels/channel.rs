@@ -6,6 +6,7 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::Stream;
+use ironclaw_common::{ExtensionName, ExternalThreadId, ExternalThreadIdError, JobResultStatus};
 use uuid::Uuid;
 
 use crate::error::ChannelError;
@@ -52,6 +53,8 @@ pub struct IncomingAttachment {
     pub source_url: Option<String>,
     /// Opaque key for host-side storage (e.g., after download/caching).
     pub storage_key: Option<String>,
+    /// Relative path to a project-local copy saved on disk, if persisted.
+    pub local_path: Option<String>,
     /// Extracted text content (e.g., OCR result, PDF text, audio transcript).
     pub extracted_text: Option<String>,
     /// Raw file bytes (for small files downloaded by the channel).
@@ -67,22 +70,29 @@ pub struct IncomingMessage {
     pub id: Uuid,
     /// Channel this message came from.
     pub channel: String,
-    /// Storage/persistence scope for this interaction.
+    /// Resolved owner identity for this message.
     ///
     /// For owner-capable channels this is the stable instance owner ID when the
-    /// configured owner is speaking; otherwise it can be a guest/sender-scoped
-    /// identifier to preserve isolation.
+    /// configured owner is speaking; for pairing-aware channels (e.g. WASM) this
+    /// is the result of `pairing_resolve_identity`; for non-pairing channels
+    /// (HTTP, web, REPL) it comes directly from the authenticated token.
     pub user_id: String,
-    /// Stable instance owner scope for this IronClaw deployment.
-    pub owner_id: String,
     /// Channel-specific sender/actor identifier.
     pub sender_id: String,
     /// Optional display name.
     pub user_name: Option<String>,
     /// Message content.
     pub content: String,
+    /// Structured submission sideband for internal callers that need exact
+    /// routing semantics without serializing control payloads into `content`.
+    pub structured_submission: Option<crate::agent::submission::Submission>,
     /// Thread/conversation ID for threaded conversations.
-    pub thread_id: Option<String>,
+    ///
+    /// This is the *external* channel-supplied thread identifier (e.g. a
+    /// Telegram chat id, Slack `thread_ts`, or web-UI UUID string) — **not**
+    /// the internal engine [`ironclaw_engine::ThreadId`] UUID. Conversion to
+    /// the internal id happens in `SessionManager::resolve_thread`.
+    pub thread_id: Option<ExternalThreadId>,
     /// Stable channel/chat/thread scope for this conversation.
     pub conversation_scope_id: Option<String>,
     /// When the message was received.
@@ -97,6 +107,25 @@ pub struct IncomingMessage {
     /// monitor) and must bypass the normal user-input pipeline. This field is
     /// not settable via metadata, so external channels cannot spoof it.
     pub(crate) is_internal: bool,
+    /// `true` when this message represents an *agent broadcast* echoing
+    /// back through the channel — e.g. an outbound bot message that the
+    /// channel adapter (Slack, Discord, etc.) re-delivers as an inbound
+    /// event. Mission `OnEvent` firing skips messages with this flag set
+    /// to avoid self-recursion: a mission whose pattern matches its own
+    /// output would otherwise re-trigger forever.
+    ///
+    /// Channel adapters that have echo behavior MUST set this when
+    /// re-emitting the agent's own outbound text. Adapters without echo
+    /// behavior (CLI, REPL, web gateway) leave it `false`.
+    pub is_agent_broadcast: bool,
+    /// When set, this message was produced as a side effect of a mission
+    /// firing — typically the mission's notification text re-entering
+    /// through a channel adapter. Mission `OnEvent` firing skips messages
+    /// tagged with a `triggering_mission_id` to bound chain-recursion
+    /// across distinct missions (mission A → notification → mission B →
+    /// notification → mission C → ...). The string is the originating
+    /// `MissionId` for diagnostics.
+    pub triggering_mission_id: Option<String>,
 }
 
 impl IncomingMessage {
@@ -110,11 +139,11 @@ impl IncomingMessage {
         Self {
             id: Uuid::new_v4(),
             channel: channel.into(),
-            owner_id: user_id.clone(),
             sender_id: user_id.clone(),
             user_id,
             user_name: None,
             content: content.into(),
+            structured_submission: None,
             thread_id: None,
             conversation_scope_id: None,
             received_at: Utc::now(),
@@ -122,20 +151,75 @@ impl IncomingMessage {
             timezone: None,
             attachments: Vec::new(),
             is_internal: false,
+            is_agent_broadcast: false,
+            triggering_mission_id: None,
         }
     }
 
-    /// Set the thread ID.
-    pub fn with_thread(mut self, thread_id: impl Into<String>) -> Self {
-        let thread_id = thread_id.into();
-        self.conversation_scope_id = Some(thread_id.clone());
-        self.thread_id = Some(thread_id);
+    /// Mark this message as an agent broadcast echo. Channel adapters that
+    /// re-emit the agent's own outbound text as an inbound event MUST call
+    /// this so mission `OnEvent` firing skips it.
+    pub fn with_agent_broadcast(mut self) -> Self {
+        self.is_agent_broadcast = true;
         self
     }
 
-    /// Set the stable owner scope for this message.
-    pub fn with_owner_id(mut self, owner_id: impl Into<String>) -> Self {
-        self.owner_id = owner_id.into();
+    /// Mark this message as having been produced by a mission firing.
+    /// Used for chain-recursion guards across distinct missions.
+    pub fn with_triggering_mission(mut self, mission_id: impl Into<String>) -> Self {
+        self.triggering_mission_id = Some(mission_id.into());
+        self
+    }
+
+    /// Set the thread ID (trusted path — no validation).
+    ///
+    /// Accepts raw strings — the value is wrapped with
+    /// [`ExternalThreadId::from_trusted`]. This is a **trusted-path
+    /// convenience**: the caller is assumed to have sourced the string from
+    /// an internal/typed origin (DB row, internal channel adapter, a
+    /// platform identifier already accepted by the upstream channel). The
+    /// `conversation_scope_id` shadow mirrors the raw string.
+    ///
+    /// **For untrusted input** (HTTP webhooks, relay callbacks, any raw
+    /// caller-supplied payload), prefer [`Self::try_with_thread`] which
+    /// validates via [`ExternalThreadId::new`] and returns an error on
+    /// empty / NUL / oversized strings. See `.claude/rules/types.md` on
+    /// the `new` vs `from_trusted` choice being the audit trail.
+    pub fn with_thread(mut self, thread_id: impl Into<String>) -> Self {
+        let thread_id = thread_id.into();
+        self.conversation_scope_id = Some(thread_id.clone());
+        self.thread_id = Some(ExternalThreadId::from_trusted(thread_id));
+        self
+    }
+
+    /// Set the thread ID from untrusted input, validating the raw string.
+    ///
+    /// Use this variant at the system boundary — HTTP webhooks, relay
+    /// callback payloads, or any path where the string came from an
+    /// external caller. Returns [`ExternalThreadIdError`] for empty,
+    /// oversized, or NUL-containing values; callers typically log and
+    /// drop the thread_id (or return 400) on error. For
+    /// internal-trusted paths (typed DB rows, already-validated channel
+    /// adapter state), use [`Self::with_thread`].
+    ///
+    /// Takes `&mut self` so callers retain ownership of the message on
+    /// validation failure (useful when the desired fallback is to
+    /// continue with an unset thread id rather than fail the whole
+    /// message).
+    pub fn try_with_thread(
+        &mut self,
+        thread_id: impl AsRef<str>,
+    ) -> Result<(), ExternalThreadIdError> {
+        let typed = ExternalThreadId::new(thread_id)?;
+        self.conversation_scope_id = Some(typed.as_str().to_string());
+        self.thread_id = Some(typed);
+        Ok(())
+    }
+
+    /// Set the thread ID from an already-typed [`ExternalThreadId`].
+    pub fn with_external_thread(mut self, thread_id: ExternalThreadId) -> Self {
+        self.conversation_scope_id = Some(thread_id.as_str().to_string());
+        self.thread_id = Some(thread_id);
         self
     }
 
@@ -163,6 +247,15 @@ impl IncomingMessage {
         self
     }
 
+    /// Attach a structured submission sideband payload.
+    pub fn with_structured_submission(
+        mut self,
+        submission: crate::agent::submission::Submission,
+    ) -> Self {
+        self.structured_submission = Some(submission);
+        self
+    }
+
     /// Set the client timezone.
     pub fn with_timezone(mut self, tz: impl Into<String>) -> Self {
         self.timezone = Some(tz.into());
@@ -185,7 +278,7 @@ impl IncomingMessage {
     pub fn conversation_scope(&self) -> Option<&str> {
         self.conversation_scope_id
             .as_deref()
-            .or(self.thread_id.as_deref())
+            .or_else(|| self.thread_id.as_ref().map(|t| t.as_str()))
     }
 
     /// Best-effort routing target for proactive replies on the current channel.
@@ -232,7 +325,10 @@ pub struct OutgoingResponse {
     /// The content to send.
     pub content: String,
     /// Optional thread ID to reply in.
-    pub thread_id: Option<String>,
+    ///
+    /// External/channel-supplied thread identifier (see
+    /// [`IncomingMessage::thread_id`]).
+    pub thread_id: Option<ExternalThreadId>,
     /// Optional file paths to attach.
     pub attachments: Vec<String>,
     /// Channel-specific metadata for the response.
@@ -250,9 +346,40 @@ impl OutgoingResponse {
         }
     }
 
-    /// Set the thread ID for the response.
+    /// Set the thread ID for the response (trusted path — no validation).
+    ///
+    /// Accepts raw strings — the value is wrapped with
+    /// [`ExternalThreadId::from_trusted`]. This is a **trusted-path
+    /// convenience**: the caller is assumed to have sourced the string
+    /// from an internal/typed origin (a channel adapter that already
+    /// accepted the identifier upstream, a DB row, etc.).
+    ///
+    /// **For untrusted input** (HTTP webhook callbacks, relay callbacks,
+    /// any raw caller-supplied payload), prefer [`Self::try_in_thread`]
+    /// which validates via [`ExternalThreadId::new`].
     pub fn in_thread(mut self, thread_id: impl Into<String>) -> Self {
-        self.thread_id = Some(thread_id.into());
+        self.thread_id = Some(ExternalThreadId::from_trusted(thread_id.into()));
+        self
+    }
+
+    /// Set the thread ID from untrusted input, validating the raw string.
+    ///
+    /// Use this variant at the system boundary — HTTP webhooks, relay
+    /// callback payloads, or any path where the string came from an
+    /// external caller. Returns [`ExternalThreadIdError`] for empty,
+    /// oversized, or NUL-containing values. For internal-trusted paths,
+    /// use [`Self::in_thread`].
+    pub fn try_in_thread(
+        &mut self,
+        thread_id: impl AsRef<str>,
+    ) -> Result<(), ExternalThreadIdError> {
+        self.thread_id = Some(ExternalThreadId::new(thread_id)?);
+        Ok(())
+    }
+
+    /// Set the thread ID from an already-typed [`ExternalThreadId`].
+    pub fn in_external_thread(mut self, thread_id: ExternalThreadId) -> Self {
+        self.thread_id = Some(thread_id);
         self
     }
 
@@ -278,7 +405,14 @@ pub enum StatusUpdate {
     /// Agent is thinking/processing.
     Thinking(String),
     /// Tool execution started.
-    ToolStarted { name: String },
+    ToolStarted {
+        name: String,
+        /// Short contextual summary extracted from tool arguments.
+        detail: Option<String>,
+        /// Stable tool-call ID when available, used to disambiguate repeated
+        /// calls to the same tool name in a single turn.
+        call_id: Option<String>,
+    },
     /// Tool execution completed.
     ///
     /// Use [`StatusUpdate::tool_completed`] to construct this variant — it
@@ -293,9 +427,18 @@ pub enum StatusUpdate {
         /// Only populated when `success` is `false`. Values listed in the
         /// tool's `sensitive_params()` are replaced with `"[REDACTED]"`.
         parameters: Option<String>,
+        /// Stable tool-call ID when available.
+        call_id: Option<String>,
+        /// Actual tool execution duration when available.
+        duration_ms: Option<u64>,
     },
     /// Brief preview of tool execution output.
-    ToolResult { name: String, preview: String },
+    ToolResult {
+        name: String,
+        preview: String,
+        /// Stable tool-call ID when available.
+        call_id: Option<String>,
+    },
     /// Streaming text chunk.
     StreamChunk(String),
     /// General status message.
@@ -320,23 +463,64 @@ pub enum StatusUpdate {
     },
     /// Extension needs user authentication (token or OAuth).
     AuthRequired {
-        extension_name: String,
+        extension_name: ExtensionName,
         instructions: Option<String>,
         auth_url: Option<String>,
         setup_url: Option<String>,
+        request_id: Option<String>,
     },
     /// Extension authentication completed.
     AuthCompleted {
-        extension_name: String,
+        extension_name: ExtensionName,
         success: bool,
         message: String,
     },
     /// An image was generated by a tool.
     ImageGenerated {
+        /// Stable identity for this generated-image event.
+        event_id: String,
         /// Base64 data URL of the generated image.
         data_url: String,
         /// Optional workspace path where the image was saved.
         path: Option<String>,
+    },
+    /// A sandbox job's status changed.
+    JobStatus { job_id: String, status: String },
+    /// A sandbox job completed with final result.
+    JobResult {
+        job_id: String,
+        status: JobResultStatus,
+    },
+    /// A routine was created, updated, or deleted.
+    RoutineUpdate {
+        id: String,
+        name: String,
+        trigger_type: String,
+        enabled: bool,
+        last_run: Option<String>,
+        next_fire: Option<String>,
+    },
+    /// Context pressure update (token usage approaching limit).
+    ContextPressure {
+        used_tokens: u64,
+        max_tokens: u64,
+        percentage: u8,
+        warning: Option<String>,
+    },
+    /// Sandbox / Docker status update.
+    SandboxStatus {
+        docker_available: bool,
+        running_containers: u32,
+        status: String,
+    },
+    /// Secrets vault status update.
+    SecretsStatus { count: u32, vault_unlocked: bool },
+    /// Cost guard / budget status update.
+    CostGuard {
+        session_budget_usd: Option<String>,
+        spent_usd: String,
+        remaining_usd: Option<String>,
+        limit_reached: bool,
     },
     /// Suggested follow-up messages for the user.
     Suggestions { suggestions: Vec<String> },
@@ -353,6 +537,76 @@ pub enum StatusUpdate {
         output_tokens: u64,
         cost_usd: String,
     },
+    /// Full (non-truncated) tool output (verbose/debug mode only).
+    ToolResultFull {
+        name: String,
+        output: String,
+        truncated: bool,
+        /// Stable tool-call ID when available.
+        call_id: Option<String>,
+    },
+    /// Per-LLM-call metrics with model, tokens, and timing (verbose/debug mode only).
+    TurnMetrics {
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read_tokens: u64,
+        model: String,
+        duration_ms: u64,
+        iteration: usize,
+    },
+    /// Skills activated for this conversation turn.
+    ///
+    /// `feedback` carries optional human-readable notes about the
+    /// activation — e.g. "chain-loaded from code-review", "ceo-setup
+    /// excluded by setup marker", "budget exhausted". Empty when the
+    /// activation path has nothing to annotate. The UI should render
+    /// each line as a muted sub-bullet under the skill list; channels
+    /// that ignore it should just drop the field.
+    SkillActivated {
+        skill_names: Vec<String>,
+        feedback: Vec<String>,
+    },
+    /// Thread list for interactive resume picker.
+    ThreadList { threads: Vec<ThreadSummary> },
+    /// Engine v2 thread list for TUI activity sidebar.
+    EngineThreadList { threads: Vec<EngineThreadSummary> },
+    /// Full conversation history for displaying a resumed thread in the TUI.
+    ConversationHistory {
+        thread_id: String,
+        messages: Vec<HistoryMessage>,
+        pending_approval: Option<ChatApprovalPrompt>,
+    },
+}
+
+/// A single message from conversation history, for hydrating the TUI on thread resume.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HistoryMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Engine v2 thread summary for TUI sidebar display.
+#[derive(Debug, Clone)]
+pub struct EngineThreadSummary {
+    pub id: String,
+    pub goal: String,
+    pub thread_type: String,
+    pub state: String,
+    pub step_count: usize,
+    pub total_tokens: u64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Lightweight thread summary for the resume picker.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ThreadSummary {
+    pub id: String,
+    pub title: Option<String>,
+    pub message_count: i64,
+    pub last_activity: String,
+    pub channel: String,
 }
 
 /// Shared chat-style approval prompt formatting used by non-web channels.
@@ -368,35 +622,112 @@ pub struct ChatApprovalPrompt {
 const APPROVAL_PARAMETER_PREVIEW_BYTES: usize = 1200;
 const APPROVAL_PARAMETER_TRUNCATION_SUFFIX: &str = "\n... [parameters truncated]";
 const APPROVAL_SUMMARY_DESCRIPTION_BYTES: usize = 120;
+const DETAIL_MAX_LEN: usize = 80;
+
+/// Extract a short, non-sensitive one-liner from tool arguments.
+///
+/// Returns `None` for unknown tools or when no relevant field is present.
+pub fn tool_call_detail(name: &str, args: &serde_json::Value) -> Option<String> {
+    let raw = match name {
+        "http" | "http_request" | "web_fetch" => {
+            let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let url = args.get("url").and_then(|v| v.as_str())?;
+            format!("{method} {url}")
+        }
+        "shell" | "execute_command" => args.get("command").and_then(|v| v.as_str())?.to_string(),
+        "read_file" | "write_file" | "list_dir" => {
+            args.get("path").and_then(|v| v.as_str())?.to_string()
+        }
+        "memory_search" => {
+            let q = args.get("query").and_then(|v| v.as_str())?;
+            format!("query: {q}")
+        }
+        "memory_read" => args.get("path").and_then(|v| v.as_str())?.to_string(),
+        "memory_write" => {
+            let target = args.get("target").and_then(|v| v.as_str())?;
+            format!("target: {target}")
+        }
+        "create_job" => args.get("title").and_then(|v| v.as_str())?.to_string(),
+        "message" | "send_message" => {
+            let channel = args.get("channel").and_then(|v| v.as_str())?;
+            format!("to: {channel}")
+        }
+        "skill_search" | "tool_search" => args.get("query").and_then(|v| v.as_str())?.to_string(),
+        _ => return None,
+    };
+
+    Some(truncate_detail(&raw))
+}
+
+fn truncate_detail(s: &str) -> String {
+    if s.chars().count() <= DETAIL_MAX_LEN {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(DETAIL_MAX_LEN.saturating_sub(3)).collect();
+        format!("{truncated}...")
+    }
+}
 
 impl StatusUpdate {
+    /// Whether this status update is verbose/debug-only (e.g. full tool output,
+    /// per-LLM-call metrics). Used to short-circuit expensive cloning when no
+    /// debug subscribers are connected.
+    pub fn is_verbose_only(&self) -> bool {
+        matches!(self, Self::ToolResultFull { .. } | Self::TurnMetrics { .. })
+    }
+
+    /// Build a `ToolStarted` status with a derived contextual detail.
+    pub fn tool_started(name: String, arguments: &serde_json::Value) -> Self {
+        Self::tool_started_with_id(name, arguments, None)
+    }
+
+    /// Build a `ToolStarted` status with an explicit tool-call ID.
+    pub fn tool_started_with_id(
+        name: String,
+        arguments: &serde_json::Value,
+        call_id: Option<String>,
+    ) -> Self {
+        Self::ToolStarted {
+            detail: tool_call_detail(&name, arguments),
+            name,
+            call_id,
+        }
+    }
+
     /// Build a `ToolCompleted` status with redacted parameters.
     ///
-    /// On failure, serializes the tool's input parameters as pretty JSON after
-    /// replacing any keys listed in the tool's `sensitive_params()` with
-    /// `"[REDACTED]"`. On success, no parameters or error are included.
+    /// Serializes the tool's input parameters as pretty JSON after replacing
+    /// any keys listed in the tool's `sensitive_params()` with `"[REDACTED]"`.
+    /// Parameters are only included on failure; verbose clients see full output
+    /// via the `ToolResultFull` event instead.
+    /// Error message is populated only on failure.
     ///
     /// Pass the resolved `Tool` reference (if available) so this method can
     /// query `sensitive_params()` directly — callers don't need to manage the
     /// borrow lifetime of the sensitive slice.
     pub fn tool_completed(
         name: String,
+        call_id: Option<String>,
         result: &Result<String, crate::error::Error>,
         params: &serde_json::Value,
         tool: Option<&dyn crate::tools::Tool>,
+        duration_ms: Option<u64>,
     ) -> Self {
         let success = result.is_ok();
         let sensitive = tool.map(|t| t.sensitive_params()).unwrap_or(&[]);
+        let parameters = if !success {
+            let safe = crate::tools::redact_params(params, sensitive);
+            Some(serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string()))
+        } else {
+            None
+        };
         Self::ToolCompleted {
             name,
             success,
             error: result.as_ref().err().map(|e| e.to_string()),
-            parameters: if !success {
-                let safe = crate::tools::redact_params(params, sensitive);
-                Some(serde_json::to_string_pretty(&safe).unwrap_or_else(|_| safe.to_string()))
-            } else {
-                None
-            },
+            parameters,
+            call_id,
+            duration_ms,
         }
     }
 }
@@ -660,19 +991,23 @@ mod tests {
 
         let status = StatusUpdate::tool_completed(
             "secret_save".into(),
+            None,
             &err,
             &params,
             Some(&tool as &dyn crate::tools::Tool),
+            Some(25),
         );
 
         if let StatusUpdate::ToolCompleted {
             success,
             error,
             parameters,
+            duration_ms,
             ..
         } = &status
         {
             assert!(!success);
+            assert_eq!(*duration_ms, Some(25));
             let err_msg = error.as_deref().expect("should have error");
             assert!(err_msg.contains("db error"), "error: {}", err_msg);
             let param_str = parameters
@@ -703,7 +1038,8 @@ mod tests {
         let params = serde_json::json!({"name": "key", "value": "secret"});
         let ok: Result<String, crate::error::Error> = Ok("done".into());
 
-        let status = StatusUpdate::tool_completed("secret_save".into(), &ok, &params, None);
+        let status =
+            StatusUpdate::tool_completed("secret_save".into(), None, &ok, &params, None, None);
 
         if let StatusUpdate::ToolCompleted {
             success,
@@ -714,7 +1050,12 @@ mod tests {
         {
             assert!(success);
             assert!(error.is_none());
-            assert!(parameters.is_none(), "no params should be sent on success");
+            // Parameters are only included on failure; verbose clients see full
+            // output via the ToolResultFull event instead.
+            assert!(
+                parameters.is_none(),
+                "params should not be included on success"
+            );
         } else {
             panic!("expected ToolCompleted variant");
         }
@@ -730,7 +1071,7 @@ mod tests {
             }
             .into());
 
-        let status = StatusUpdate::tool_completed("shell".into(), &err, &params, None);
+        let status = StatusUpdate::tool_completed("shell".into(), None, &err, &params, None, None);
 
         if let StatusUpdate::ToolCompleted { parameters, .. } = &status {
             let param_str = parameters.as_ref().expect("should have parameters");
@@ -748,6 +1089,43 @@ mod tests {
     fn test_incoming_message_with_timezone() {
         let msg = IncomingMessage::new("test", "user1", "hello").with_timezone("America/New_York");
         assert_eq!(msg.timezone.as_deref(), Some("America/New_York"));
+    }
+
+    #[test]
+    fn tool_call_detail_http() {
+        let args = serde_json::json!({"method": "POST", "url": "https://api.example.com/data"});
+        let detail = super::tool_call_detail("http", &args);
+        assert_eq!(detail.as_deref(), Some("POST https://api.example.com/data"));
+    }
+
+    #[test]
+    fn tool_call_detail_shell() {
+        let args = serde_json::json!({"command": "cargo test --all"});
+        let detail = super::tool_call_detail("shell", &args);
+        assert_eq!(detail.as_deref(), Some("cargo test --all"));
+    }
+
+    #[test]
+    fn tool_call_detail_memory_search() {
+        let args = serde_json::json!({"query": "database migration"});
+        let detail = super::tool_call_detail("memory_search", &args);
+        assert_eq!(detail.as_deref(), Some("query: database migration"));
+    }
+
+    #[test]
+    fn tool_call_detail_unknown_tool() {
+        let args = serde_json::json!({"foo": "bar"});
+        let detail = super::tool_call_detail("unknown_tool_xyz", &args);
+        assert!(detail.is_none());
+    }
+
+    #[test]
+    fn tool_call_detail_truncation() {
+        let long_url = format!("https://example.com/{}", "a".repeat(100));
+        let args = serde_json::json!({"url": long_url});
+        let detail = super::tool_call_detail("http", &args).unwrap();
+        assert!(detail.chars().count() <= super::DETAIL_MAX_LEN);
+        assert!(detail.ends_with("..."));
     }
 
     #[test]

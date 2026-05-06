@@ -204,6 +204,11 @@ impl CapabilitiesFile {
             }
         }
 
+        // Credential `path_patterns` validation runs during the conversion
+        // in `CredentialMappingSchema::to_credential_mapping` (drops the
+        // whole mapping on any invalid pattern, with a warning). Nothing to
+        // re-check here.
+
         // Manual auth (no OAuth) checks
         if let Some(auth) = &self.auth
             && auth.oauth.is_none()
@@ -303,10 +308,16 @@ impl HttpCapabilitySchema {
                 .iter()
                 .map(|p| p.to_endpoint_pattern())
                 .collect(),
+            // filter_map drops mappings with invalid `path_patterns` rather
+            // than loading them — see `to_credential_mapping` for the empty-
+            // string silent-widening hazard this guards against.
             credentials: self
                 .credentials
                 .values()
-                .map(|m| (m.secret_name.clone(), m.to_credential_mapping()))
+                .filter_map(|m| {
+                    m.to_credential_mapping()
+                        .map(|cm| (m.secret_name.clone(), cm))
+                })
                 .collect(),
             rate_limit: self
                 .rate_limit
@@ -367,15 +378,49 @@ pub struct CredentialMappingSchema {
     /// Host patterns this credential applies to.
     #[serde(default)]
     pub host_patterns: Vec<String>,
+
+    /// Literal path prefixes (not globs) this credential is scoped to.
+    /// Empty means all paths.
+    #[serde(default)]
+    pub path_patterns: Vec<String>,
+
+    /// When `true`, the host may run the tool without resolving this
+    /// credential (graceful degradation). Defaults to `false` (required) so
+    /// a tool that simply declares a credential cannot be silently
+    /// downgraded to an unauthenticated request.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 impl CredentialMappingSchema {
-    fn to_credential_mapping(&self) -> CredentialMapping {
-        CredentialMapping {
+    /// Convert to a runtime `CredentialMapping`, returning `None` if the
+    /// declared `path_patterns` contain any invalid entry per
+    /// `ironclaw_skills::validate_path_pattern`. Skipping the mapping (rather
+    /// than loading it with a warning) matches the skill-side behavior and
+    /// prevents `path_patterns: [""]` from silently widening scope: an empty
+    /// prefix matches every request path, so a "validation-failed" pattern
+    /// that still gets loaded re-opens the credential to global scope —
+    /// the opposite of what the author wrote.
+    fn to_credential_mapping(&self) -> Option<CredentialMapping> {
+        for pattern in &self.path_patterns {
+            let errs = ironclaw_skills::validate_path_pattern(&self.secret_name, pattern);
+            if !errs.is_empty() {
+                for err in errs {
+                    tracing::warn!(
+                        "capabilities: dropping invalid credential mapping — {}",
+                        err
+                    );
+                }
+                return None;
+            }
+        }
+        Some(CredentialMapping {
             secret_name: self.secret_name.clone(),
             location: self.location.to_credential_location(),
             host_patterns: self.host_patterns.clone(),
-        }
+            path_patterns: self.path_patterns.clone(),
+            optional: self.optional,
+        })
     }
 }
 
@@ -651,6 +696,13 @@ pub struct OAuthConfigSchema {
     #[serde(default)]
     pub extra_params: std::collections::HashMap<String, String>,
 
+    /// Optional guidance shown alongside the auth URL while the OAuth flow is pending.
+    ///
+    /// Use this for provider-specific recovery instructions such as alternate
+    /// client setup, consent quirks, or hosted deployment notes.
+    #[serde(default)]
+    pub pending_instructions: Option<String>,
+
     /// Field name in token response containing the access token.
     /// Defaults to "access_token".
     #[serde(default = "default_access_token_field")]
@@ -738,9 +790,6 @@ pub struct ToolFieldSetupSchema {
     /// `selected_model`.
     #[serde(default)]
     pub setting_path: Option<String>,
-    /// Whether changing this field requires a restart to fully apply.
-    #[serde(default)]
-    pub restart_required: bool,
 }
 
 /// Input widget type for a setup field.
@@ -1259,8 +1308,7 @@ mod tests {
                     {
                         "name": "llm_backend",
                         "prompt": "LLM Provider",
-                        "setting_path": "llm_backend",
-                        "restart_required": true
+                        "setting_path": "llm_backend"
                     },
                     {
                         "name": "selected_model",
@@ -1286,7 +1334,6 @@ mod tests {
             setup.required_fields[0].setting_path.as_deref(),
             Some("llm_backend")
         );
-        assert!(setup.required_fields[0].restart_required);
         assert_eq!(
             setup.required_fields[0].input_type,
             crate::tools::wasm::capabilities_schema::ToolSetupFieldInputType::Text
@@ -1576,6 +1623,80 @@ mod tests {
     }
 
     /// Regression test for issue #976: oversized description strings are truncated.
+    #[test]
+    fn test_invalid_path_pattern_drops_mapping_not_widens_scope() {
+        // Regression for Firat round-5 (#3126256040): path_patterns: [""]
+        // used to pass the warning-only validator and stay loaded, but an
+        // empty prefix matches every request path — effectively widening
+        // the credential back to global scope. The bad mapping is now
+        // dropped entirely rather than warning-and-loaded.
+        let json = r#"{
+            "http": {
+                "allowlist": [{ "host": "api.example.com" }],
+                "credentials": {
+                    "bad_empty_path": {
+                        "secret_name": "bad_empty_path",
+                        "location": { "type": "bearer" },
+                        "host_patterns": ["api.example.com"],
+                        "path_patterns": [""]
+                    }
+                }
+            }
+        }"#;
+        let caps = CapabilitiesFile::from_json(json).unwrap();
+        let http = caps.http.unwrap();
+        let runtime = http.to_http_capability();
+        assert!(
+            runtime.credentials.is_empty(),
+            "invalid path_patterns must drop the entire mapping, got {:?}",
+            runtime.credentials.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_invalid_path_pattern_missing_leading_slash_drops_mapping() {
+        let json = r#"{
+            "http": {
+                "allowlist": [{ "host": "api.example.com" }],
+                "credentials": {
+                    "bad_no_slash": {
+                        "secret_name": "bad_no_slash",
+                        "location": { "type": "bearer" },
+                        "host_patterns": ["api.example.com"],
+                        "path_patterns": ["api/v1"]
+                    }
+                }
+            }
+        }"#;
+        let caps = CapabilitiesFile::from_json(json).unwrap();
+        let runtime = caps.http.unwrap().to_http_capability();
+        assert!(runtime.credentials.is_empty());
+    }
+
+    #[test]
+    fn test_valid_path_pattern_preserved() {
+        let json = r#"{
+            "http": {
+                "allowlist": [{ "host": "api.example.com" }],
+                "credentials": {
+                    "ok": {
+                        "secret_name": "ok",
+                        "location": { "type": "bearer" },
+                        "host_patterns": ["api.example.com"],
+                        "path_patterns": ["/api/v1"]
+                    }
+                }
+            }
+        }"#;
+        let caps = CapabilitiesFile::from_json(json).unwrap();
+        let runtime = caps.http.unwrap().to_http_capability();
+        assert_eq!(runtime.credentials.len(), 1);
+        assert_eq!(
+            runtime.credentials["ok"].path_patterns,
+            vec!["/api/v1".to_string()]
+        );
+    }
+
     #[test]
     fn test_description_truncated_at_limit() {
         let long_desc = "x".repeat(10_000);

@@ -38,6 +38,26 @@ pub struct ImageUrl {
     pub detail: Option<String>,
 }
 
+impl ImageUrl {
+    /// Normalize the OpenAI image detail hint, defaulting missing or invalid
+    /// values to `"auto"` per the Chat Completions schema.
+    pub fn normalized_openai_detail(&self) -> String {
+        normalize_openai_image_detail(self.detail.as_deref())
+    }
+}
+
+/// Normalize an OpenAI image detail hint, defaulting to `"auto"` when absent.
+pub fn normalize_openai_image_detail(detail: Option<&str>) -> String {
+    match detail
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .map(|detail| detail.to_ascii_lowercase())
+    {
+        Some(detail) if matches!(detail.as_str(), "auto" | "low" | "high") => detail,
+        _ => "auto".to_string(),
+    }
+}
+
 /// A message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -190,6 +210,13 @@ impl CompletionRequest {
         self.temperature = Some(temperature);
         self
     }
+
+    /// Take the per-request model override, normalizing sentinel values like
+    /// `"default"` and blank strings to `None`.
+    pub fn take_model_override(&mut self) -> Option<String> {
+        let model = self.model.take();
+        normalized_model_override(model.as_deref()).map(str::to_string)
+    }
 }
 
 /// Response from a chat completion.
@@ -332,6 +359,24 @@ impl ToolCompletionRequest {
         self.tool_choice = Some(choice.into());
         self
     }
+
+    /// Take the per-request model override, normalizing sentinel values like
+    /// `"default"` and blank strings to `None`.
+    pub fn take_model_override(&mut self) -> Option<String> {
+        let model = self.model.take();
+        normalized_model_override(model.as_deref()).map(str::to_string)
+    }
+}
+
+/// Normalize a requested model override.
+///
+/// `"default"` is treated as a sentinel meaning "use the provider's active
+/// model", matching the gateway APIs and protecting providers like Anthropic
+/// that reject the literal string as an unknown model ID.
+pub fn normalized_model_override(model: Option<&str>) -> Option<&str> {
+    model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !model.eq_ignore_ascii_case("default"))
 }
 
 /// Response from a completion with potential tool calls.
@@ -396,7 +441,7 @@ pub trait LlmProvider: Send + Sync {
     /// Providers that ignore per-request model overrides should override this
     /// and return `active_model_name()`.
     fn effective_model_name(&self, requested_model: Option<&str>) -> String {
-        requested_model
+        normalized_model_override(requested_model)
             .map(std::borrow::ToOwned::to_owned)
             .unwrap_or_else(|| self.active_model_name())
     }
@@ -438,6 +483,95 @@ pub trait LlmProvider: Send + Sync {
     /// OpenAI would return `2` (50% off).
     fn cache_read_discount(&self) -> Decimal {
         Decimal::ONE
+    }
+}
+
+#[cfg(test)]
+mod model_override_tests {
+    use async_trait::async_trait;
+    use rust_decimal::Decimal;
+
+    use super::*;
+    use crate::llm::error::LlmError;
+
+    struct StubProvider;
+
+    #[async_trait]
+    impl LlmProvider for StubProvider {
+        fn model_name(&self) -> &str {
+            "stub-model"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("test-only stub")
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            unreachable!("test-only stub")
+        }
+    }
+
+    #[test]
+    fn effective_model_name_treats_default_as_no_override() {
+        let provider = StubProvider;
+        assert_eq!(provider.effective_model_name(Some("default")), "stub-model");
+        assert_eq!(
+            provider.effective_model_name(Some("  DEFAULT  ")),
+            "stub-model"
+        );
+    }
+
+    #[test]
+    fn completion_request_take_model_override_ignores_default_and_blank() {
+        let mut blank = CompletionRequest::new(vec![ChatMessage::user("hi")]).with_model("   ");
+        assert_eq!(blank.take_model_override(), None);
+
+        let mut default =
+            CompletionRequest::new(vec![ChatMessage::user("hi")]).with_model(" default ");
+        assert_eq!(default.take_model_override(), None);
+
+        let mut real =
+            CompletionRequest::new(vec![ChatMessage::user("hi")]).with_model("claude-opus-4-6");
+        assert_eq!(
+            real.take_model_override().as_deref(),
+            Some("claude-opus-4-6")
+        );
+    }
+
+    #[test]
+    fn tool_completion_request_take_model_override_ignores_default_and_blank() {
+        let tools = vec![ToolDefinition {
+            name: "echo".to_string(),
+            description: "Echo input".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                }
+            }),
+        }];
+
+        let mut blank = ToolCompletionRequest::new(vec![ChatMessage::user("hi")], tools.clone())
+            .with_model("   ");
+        assert_eq!(blank.take_model_override(), None);
+
+        let mut default = ToolCompletionRequest::new(vec![ChatMessage::user("hi")], tools.clone())
+            .with_model("default");
+        assert_eq!(default.take_model_override(), None);
+
+        let mut real =
+            ToolCompletionRequest::new(vec![ChatMessage::user("hi")], tools).with_model("qwen3");
+        assert_eq!(real.take_model_override().as_deref(), Some("qwen3"));
     }
 }
 
@@ -633,6 +767,35 @@ mod tests {
                  but duplicate ID '{id}' found for seeds ({a}, {b})"
             );
         }
+    }
+
+    #[test]
+    fn normalize_openai_image_detail_defaults_to_auto() {
+        assert_eq!(normalize_openai_image_detail(None), "auto");
+        assert_eq!(normalize_openai_image_detail(Some("")), "auto");
+        assert_eq!(normalize_openai_image_detail(Some("AUTO")), "auto");
+        assert_eq!(normalize_openai_image_detail(Some("unexpected")), "auto");
+    }
+
+    #[test]
+    fn normalize_openai_image_detail_preserves_valid_values() {
+        assert_eq!(normalize_openai_image_detail(Some("low")), "low");
+        assert_eq!(normalize_openai_image_detail(Some("high")), "high");
+        assert_eq!(normalize_openai_image_detail(Some(" auto ")), "auto");
+    }
+
+    #[test]
+    fn image_content_part_without_url_is_rejected() {
+        let err = serde_json::from_value::<ContentPart>(serde_json::json!({
+            "type": "image_url",
+            "image_url": {}
+        }))
+        .expect_err("missing image_url.url must fail");
+
+        assert!(
+            err.to_string().contains("url"),
+            "expected error to mention missing url, got: {err}"
+        );
     }
 
     #[test]

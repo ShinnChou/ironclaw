@@ -10,6 +10,9 @@
 //! types become thin wrappers that delegate to `Arc<dyn Database>`.
 
 #[cfg(feature = "postgres")]
+pub mod migration_fixup;
+
+#[cfg(feature = "postgres")]
 pub mod postgres;
 
 #[cfg(feature = "postgres")]
@@ -20,6 +23,8 @@ pub mod libsql;
 
 #[cfg(feature = "libsql")]
 pub mod libsql_migrations;
+
+pub mod cached_settings;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +43,7 @@ use crate::history::{
     AgentJobRecord, AgentJobSummary, ConversationMessage, ConversationSummary, JobEventRecord,
     LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow,
 };
-use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
+use crate::workspace::{ChunkWrite, MemoryChunk, MemoryDocument, WorkspaceEntry};
 use crate::workspace::{SearchConfig, SearchResult};
 
 /// Create a database backend from configuration, run migrations, and return it.
@@ -330,6 +335,20 @@ pub struct UserRecord {
     pub metadata: serde_json::Value,
 }
 
+impl UserRecord {
+    /// Returns `true` if this user holds the admin role.
+    ///
+    /// Comparison is case-insensitive so a future row that stores
+    /// `"Admin"` (e.g. from a manual SQL fix or a renaming refactor)
+    /// still authenticates as admin instead of silently failing
+    /// closed. Use this helper everywhere instead of literal
+    /// `user.role == "admin"` so the canonicalisation rule lives in
+    /// one place.
+    pub fn is_admin(&self) -> bool {
+        self.role.eq_ignore_ascii_case("admin")
+    }
+}
+
 /// An API token for authenticating requests (hash stored, never plaintext).
 #[derive(Debug, Clone)]
 pub struct ApiTokenRecord {
@@ -344,6 +363,27 @@ pub struct ApiTokenRecord {
     pub created_at: DateTime<Utc>,
     /// Soft-revoke timestamp. Non-null means revoked.
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+// ==================== User identity record types ====================
+
+/// A linked external identity from an OAuth/social login provider.
+#[derive(Debug, Clone)]
+pub struct UserIdentityRecord {
+    pub id: Uuid,
+    pub user_id: String,
+    /// Provider name (e.g. `google`, `github`, `apple`, `near`, `email`).
+    pub provider: String,
+    /// Provider-specific unique user identifier (Google `sub`, GitHub user ID, etc.).
+    pub provider_user_id: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    /// Raw JSON profile payload from the provider for debugging/auditing.
+    pub raw_profile: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 // ==================== Sub-traits ====================
@@ -367,6 +407,14 @@ pub trait ConversationStore: Send + Sync {
         role: &str,
         content: &str,
     ) -> Result<Uuid, DatabaseError>;
+    /// Insert a message only if the conversation has zero messages.
+    /// Returns `Ok(true)` if the message was inserted, `Ok(false)` if skipped.
+    async fn add_conversation_message_if_empty(
+        &self,
+        conversation_id: Uuid,
+        role: &str,
+        content: &str,
+    ) -> Result<bool, DatabaseError>;
     async fn ensure_conversation(
         &self,
         id: Uuid,
@@ -490,6 +538,14 @@ pub trait JobStore: Send + Sync {
         actual_time_secs: i32,
         actual_value: Option<Decimal>,
     ) -> Result<(), DatabaseError>;
+
+    /// Create a lightweight system job for audit trail purposes.
+    ///
+    /// System jobs are instantly-completed job records that serve as FK anchors
+    /// for `ActionRecord`s created by non-agent callers (gateway handlers, CLI
+    /// commands, routine engines). They have `category = 'system'` and
+    /// `status = 'completed'` (snake_case to match `JobState::Completed.to_string()`).
+    async fn create_system_job(&self, user_id: &str, source: &str) -> Result<Uuid, DatabaseError>;
 }
 
 #[async_trait]
@@ -693,6 +749,20 @@ pub trait WorkspaceStore: Send + Sync {
         content: &str,
         embedding: Option<&[f32]>,
     ) -> Result<Uuid, WorkspaceError>;
+    /// Atomically replace all chunks for a document.
+    ///
+    /// Runs `DELETE FROM memory_chunks WHERE document_id = ?` followed by one
+    /// `INSERT` per `ChunkWrite` inside a single transaction. This closes the
+    /// TOCTOU race where two concurrent reindexers for the same document
+    /// could both delete, then both try to `INSERT` chunk_index 0 and hit the
+    /// `UNIQUE (document_id, chunk_index)` constraint.
+    ///
+    /// Passing an empty slice is equivalent to `delete_chunks(document_id)`.
+    async fn replace_chunks(
+        &self,
+        document_id: Uuid,
+        chunks: &[ChunkWrite],
+    ) -> Result<(), WorkspaceError>;
     async fn update_chunk_embedding(
         &self,
         chunk_id: Uuid,
@@ -905,6 +975,13 @@ pub trait UserStore: Send + Sync {
 
     /// Create a new user record.
     async fn create_user(&self, user: &UserRecord) -> Result<(), DatabaseError>;
+
+    /// Create the user if they do not already exist. Idempotent.
+    ///
+    /// Each backend must override this with an atomic upsert (PostgreSQL:
+    /// `ON CONFLICT DO NOTHING`; libSQL: `INSERT OR IGNORE`) to avoid the
+    /// TOCTOU race in a SELECT + INSERT sequence.
+    async fn get_or_create_user(&self, user: UserRecord) -> Result<(), DatabaseError>;
     /// Get a user by their string id.
     async fn get_user(&self, id: &str) -> Result<Option<UserRecord>, DatabaseError>;
     /// Get a user by email address.
@@ -971,6 +1048,12 @@ pub trait UserStore: Send + Sync {
         user_id: Option<&str>,
     ) -> Result<Vec<UserSummaryStats>, DatabaseError>;
 
+    /// Aggregated usage summary for the admin dashboard.
+    async fn admin_usage_summary(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<AdminUsageSummary, DatabaseError>;
+
     /// Create a user and their initial API token atomically.
     /// If either operation fails, both are rolled back.
     async fn create_user_with_token(
@@ -1006,6 +1089,163 @@ pub struct UserSummaryStats {
     pub last_active_at: Option<DateTime<Utc>>,
 }
 
+/// Aggregated usage summary for the admin dashboard.
+///
+/// LLM usage fields (`llm_calls`, `input_tokens`, `output_tokens`, `usage_cost`)
+/// are scoped to the 30-day window passed as `since` — this keeps the query
+/// index-driven and avoids full `llm_calls` scans on every dashboard refresh.
+#[derive(Debug, Clone)]
+pub struct AdminUsageSummary {
+    pub total_users: i64,
+    pub active_users: i64,
+    pub suspended_users: i64,
+    pub admin_users: i64,
+    pub total_jobs: i64,
+    pub llm_calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub usage_cost: Decimal,
+}
+
+/// A pending pairing request.
+#[derive(Debug, Clone)]
+pub struct PairingRequestRecord {
+    pub id: uuid::Uuid,
+    pub channel: String,
+    pub external_id: String,
+    pub code: String,
+    pub created: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Result of approving a pairing request.
+#[derive(Debug, Clone)]
+pub struct PairingApprovalRecord {
+    pub request_id: uuid::Uuid,
+    pub channel: String,
+    pub external_id: String,
+    pub owner_id: String,
+    pub previous_owner_id: Option<String>,
+}
+
+/// Pairing and channel identity operations.
+/// Named `ChannelPairingStore` to avoid collision with the application-level
+/// `PairingStore` struct in `src/pairing/store.rs`.
+#[async_trait]
+pub trait ChannelPairingStore: Send + Sync {
+    /// Returns the [`crate::ownership::UserId`] for `(channel, external_id)` if the sender
+    /// has been paired. Joins `channel_identities` with `users` to get id + role in one query.
+    async fn resolve_channel_identity(
+        &self,
+        channel: &str,
+        external_id: &str,
+    ) -> Result<Option<crate::ownership::UserId>, DatabaseError>;
+
+    /// Read paired external IDs for a channel, for compatibility with legacy
+    /// allow-list-based WASM channel admission.
+    async fn read_allow_from(&self, channel: &str) -> Result<Vec<String>, DatabaseError>;
+
+    /// Resolve the durable external actor ID bound to `(channel, owner_id)`.
+    /// Used for proactive notifications and runtime owner recovery.
+    async fn resolve_channel_external_id_for_owner(
+        &self,
+        channel: &str,
+        owner_id: &str,
+    ) -> Result<Option<String>, DatabaseError>;
+
+    /// Create or replace the pending pairing request for `(channel, external_id)`.
+    /// Any existing non-expired pending request for the same sender is retired and a new code
+    /// is issued so retrying the claim flow always rotates to a fresh code.
+    async fn upsert_pairing_request(
+        &self,
+        channel: &str,
+        external_id: &str,
+        meta: Option<serde_json::Value>,
+    ) -> Result<PairingRequestRecord, DatabaseError>;
+
+    /// Approve the pairing `code`, mapping `(channel, external_id)` → `owner_id`.
+    /// Sets owner_id on the pairing_requests row + creates channel_identities row — one transaction.
+    /// Returns `Err` if code is invalid, expired, already approved, or belongs to a different channel.
+    async fn approve_pairing(
+        &self,
+        channel: &str,
+        code: &str,
+        owner_id: &str,
+    ) -> Result<PairingApprovalRecord, DatabaseError>;
+
+    /// Revert a previously approved pairing when runtime propagation fails.
+    async fn revert_pairing_approval(
+        &self,
+        approval: &PairingApprovalRecord,
+    ) -> Result<(), DatabaseError>;
+
+    /// List pending (unapproved, non-expired) pairing requests for a channel.
+    async fn list_pending_pairings(
+        &self,
+        channel: &str,
+    ) -> Result<Vec<PairingRequestRecord>, DatabaseError>;
+
+    /// Remove a channel identity (unlink a channel from a user).
+    async fn remove_channel_identity(
+        &self,
+        channel: &str,
+        external_id: &str,
+    ) -> Result<(), DatabaseError>;
+}
+
+/// Generates an 8-character pairing code from an unambiguous alphabet.
+pub fn generate_pairing_code() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut rng = rand::rngs::OsRng;
+    (0..8)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
+/// Persistence for linked external identities (OAuth/social login providers).
+#[async_trait]
+pub trait IdentityStore: Send + Sync {
+    /// Find a user identity by provider and provider-specific user ID.
+    async fn get_identity_by_provider(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+    ) -> Result<Option<UserIdentityRecord>, DatabaseError>;
+
+    /// Find all identities linked to a user.
+    async fn list_identities_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<UserIdentityRecord>, DatabaseError>;
+
+    /// Create a new identity link.
+    async fn create_identity(&self, identity: &UserIdentityRecord) -> Result<(), DatabaseError>;
+
+    /// Update display_name and avatar_url on an existing identity (e.g. on re-login).
+    async fn update_identity_profile(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+        display_name: Option<&str>,
+        avatar_url: Option<&str>,
+    ) -> Result<(), DatabaseError>;
+
+    /// Find identities with a given verified email (for automatic account linking).
+    async fn find_identity_by_verified_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<UserIdentityRecord>, DatabaseError>;
+
+    /// Create a new user and link an identity atomically.
+    async fn create_user_with_identity(
+        &self,
+        user: &UserRecord,
+        identity: &UserIdentityRecord,
+    ) -> Result<(), DatabaseError>;
+}
+
 /// Backend-agnostic database supertrait.
 ///
 /// Combines all sub-traits into one. Existing `Arc<dyn Database>` consumers
@@ -1020,11 +1260,17 @@ pub trait Database:
     + SettingsStore
     + WorkspaceStore
     + UserStore
+    + ChannelPairingStore
+    + IdentityStore
     + Send
     + Sync
 {
     /// Run schema migrations for this backend.
     async fn run_migrations(&self) -> Result<(), DatabaseError>;
+
+    /// Rewrite all rows where user_id = 'default' to owner_id across all
+    /// affected tables. Idempotent — safe to call on every startup.
+    async fn migrate_default_owner(&self, owner_id: &str) -> Result<(), DatabaseError>;
 }
 
 #[cfg(test)]

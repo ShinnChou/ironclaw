@@ -29,13 +29,13 @@ mod tests {
     use ironclaw::extensions::ExtensionManager;
     use ironclaw::hooks::HookRegistry;
     use ironclaw::llm::LlmProvider;
-    use ironclaw::safety::SafetyLayer;
     use ironclaw::secrets::{InMemorySecretsStore, SecretsCrypto, SecretsStore};
     use ironclaw::tools::builtin::routine::RoutineUpdateTool;
     use ironclaw::tools::mcp::{McpProcessManager, McpSessionManager};
     use ironclaw::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput, ToolRegistry};
     use ironclaw::workspace::Workspace;
     use ironclaw::workspace::hygiene::HygieneConfig;
+    use ironclaw_safety::SafetyLayer;
 
     use crate::support::trace_llm::{LlmTrace, TraceLlm, TraceResponse, TraceStep, TraceToolCall};
 
@@ -127,12 +127,10 @@ mod tests {
     fn make_message(
         channel: &str,
         user_id: &str,
-        owner_id: &str,
         sender_id: &str,
         content: &str,
     ) -> IncomingMessage {
         IncomingMessage::new(channel, user_id, content)
-            .with_owner_id(owner_id)
             .with_sender_id(sender_id)
             .with_metadata(serde_json::json!({}))
     }
@@ -344,14 +342,14 @@ mod tests {
             SchedulerDeps {
                 tools: registry.clone(),
                 extension_manager: extension_manager.clone(),
-                store: Some(ironclaw::tenant::AdminScope::new(db.clone())),
+                store: Some(ironclaw::tenant::SystemScope::new(db.clone())),
                 hooks: Arc::new(HookRegistry::new()),
             },
         ));
 
         Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(db),
+            ironclaw::tenant::SystemScope::new(db),
             llm,
             ws,
             notify_tx,
@@ -360,6 +358,7 @@ mod tests {
             registry,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ))
     }
 
@@ -482,7 +481,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(db.clone()),
+            ironclaw::tenant::SystemScope::new(db.clone()),
             llm,
             ws,
             notify_tx,
@@ -491,6 +490,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert a cron routine with next_fire_at in the past.
@@ -561,7 +561,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(db.clone()),
+            ironclaw::tenant::SystemScope::new(db.clone()),
             llm,
             ws,
             notify_tx,
@@ -570,6 +570,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert an event routine matching "deploy.*production".
@@ -587,13 +588,7 @@ mod tests {
         engine.refresh_event_cache().await;
 
         // Positive match: message containing "deploy to production".
-        let matching_msg = make_message(
-            "test",
-            "default",
-            "default",
-            "default",
-            "deploy to production now",
-        );
+        let matching_msg = make_message("test", "default", "default", "deploy to production now");
         let fired = engine
             .check_event_triggers(&matching_msg, &matching_msg.content)
             .await;
@@ -608,7 +603,6 @@ mod tests {
         // Negative match: message that doesn't match.
         let non_matching_msg = make_message(
             "test",
-            "default",
             "default",
             "default",
             "check the staging environment",
@@ -648,7 +642,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(db.clone()),
+            ironclaw::tenant::SystemScope::new(db.clone()),
             llm,
             ws,
             notify_tx,
@@ -657,6 +651,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         let routine = make_routine(
@@ -673,7 +668,6 @@ mod tests {
         let guest_msg = make_message(
             "telegram",
             "guest",
-            "default",
             "guest-sender",
             "deploy to production now",
         );
@@ -697,7 +691,6 @@ mod tests {
 
         let owner_msg = make_message(
             "telegram",
-            "default",
             "default",
             "owner-sender",
             "deploy to production now",
@@ -757,7 +750,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(db.clone()),
+            ironclaw::tenant::SystemScope::new(db.clone()),
             llm,
             ws,
             notify_tx,
@@ -766,6 +759,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         let mut filters = std::collections::HashMap::new();
@@ -900,7 +894,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(db.clone()),
+            ironclaw::tenant::SystemScope::new(db.clone()),
             llm,
             ws,
             notify_tx,
@@ -909,6 +903,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert an event routine with 1-hour cooldown.
@@ -925,13 +920,7 @@ mod tests {
         engine.refresh_event_cache().await;
 
         // First fire should work.
-        let msg = make_message(
-            "test",
-            "default",
-            "default",
-            "default",
-            "test-cooldown trigger",
-        );
+        let msg = make_message("test", "default", "default", "test-cooldown trigger");
         let fired1 = engine.check_event_triggers(&msg, &msg.content).await;
         assert!(fired1 >= 1, "First fire should work");
 
@@ -1081,7 +1070,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(Arc::clone(&db)),
+            ironclaw::tenant::SystemScope::new(Arc::clone(&db)),
             llm,
             ws,
             notify_tx,
@@ -1090,6 +1079,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         (engine, db, dir)
@@ -1203,7 +1193,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             RoutineConfig::default(),
-            ironclaw::tenant::AdminScope::new(db.clone()),
+            ironclaw::tenant::SystemScope::new(db.clone()),
             llm,
             ws,
             notify_tx,
@@ -1212,6 +1202,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Create a full_job routine with max_concurrent = 1
@@ -1311,7 +1302,7 @@ mod tests {
 
         let engine = Arc::new(RoutineEngine::new(
             config,
-            ironclaw::tenant::AdminScope::new(db.clone()),
+            ironclaw::tenant::SystemScope::new(db.clone()),
             llm,
             ws,
             notify_tx,
@@ -1320,6 +1311,7 @@ mod tests {
             tools,
             safety,
             ironclaw::agent::routine_engine::SandboxReadiness::DisabledByConfig,
+            None,
         ));
 
         // Insert a due cron routine
